@@ -583,6 +583,14 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_REPACK)
     endif()
 
+    if (GGML_CPU_NEUTRON)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_NEUTRON)
+        target_sources(${GGML_CPU_NAME} PRIVATE ggml-cpu/neutron/ggml-cpu-neutron.cpp ggml-cpu/neutron/neutron_pack.cpp)
+        target_include_directories(${GGML_CPU_NAME} PRIVATE ggml-cpu/neutron)
+        find_library(NEUTRON_DRIVER_LIB NeutronDriver REQUIRED)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE ${NEUTRON_DRIVER_LIB})
+    endif()
+
     if (GGML_CPU_KLEIDIAI)
         # upstream repo requires at least cmake 3.16
         if (CMAKE_VERSION VERSION_LESS 3.16)
