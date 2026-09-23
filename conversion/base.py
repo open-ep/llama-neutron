@@ -1865,6 +1865,13 @@ class TextModel(ModelBase):
             # ref: https://huggingface.co/ufakai/ufakzeka-1
             res = "ufakzeka"
 
+        if chkhsh == "4b05e02dad1c5ae07d266fd3342ddb644c6f6be058d728bc0a33af31a1d6ee66":
+            # mmBERT (Laya multilingual): BPE with a Metaspace pre-tokenizer, not ByteLevel.
+            # llama.cpp has no Metaspace-from-tokenizer.json path, so the embedded vocab is not
+            # usable for tokenization -- callers must supply token ids themselves. Tagging it
+            # "default" only lets the weights load.
+            res = "default"
+
         if res is None:
             logger.warning("\n")
             logger.warning("**************************************************************************************")
