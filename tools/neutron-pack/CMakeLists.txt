@@ -1,0 +1,7 @@
+set(TARGET neutron-pack)
+find_library(NEUTRON_DRIVER_LIB NeutronDriver REQUIRED)
+add_executable(${TARGET} neutron-pack.cpp ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu/neutron/neutron_pack.cpp)
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu/neutron ${CMAKE_SOURCE_DIR}/ggml/include)
+target_link_libraries(${TARGET} PRIVATE ggml-base ${NEUTRON_DRIVER_LIB})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TARGET} RUNTIME)

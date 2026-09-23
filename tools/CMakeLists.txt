@@ -43,3 +43,7 @@ else()
     endif()
     add_subdirectory(results)
 endif()
+
+if (GGML_CPU_NEUTRON)
+    add_subdirectory(neutron-pack)
+endif()
