@@ -1,0 +1,5 @@
+set(TARGET laya-score)
+add_executable(${TARGET} laya.cpp)
+target_link_libraries(${TARGET} PRIVATE llama llama-common ggml-base)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+install(TARGETS ${TARGET} RUNTIME)

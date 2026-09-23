@@ -47,3 +47,5 @@ endif()
 if (GGML_CPU_NEUTRON)
     add_subdirectory(neutron-pack)
 endif()
+
+add_subdirectory(laya)
