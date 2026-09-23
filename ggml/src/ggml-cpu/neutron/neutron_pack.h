@@ -150,3 +150,26 @@ void neutron_layout_from_blob(uint8_t* out, int N, int K, uint32_t weight_len, i
 
 // cache-clean hook used by the pack functions (default: libNeutronDriver clean_cache)
 extern int (*neutron_clean_cache)(const void *, int);
+
+// ---- shared by the ggml backend and the standalone neutron-pack tool (added) ----
+#ifdef __cplusplus
+#include <string>
+#include <vector>
+// K values verified correct on Neutron firmware 3.1.1; other K are split into these chunks (partial sums on CPU).
+// Returns the minimal-count partition of K, or an empty vector if K cannot be expressed. Env NEUTRON_K_ALLOW overrides.
+const std::vector<int> & neutron_k_chunks(int K);
+uint64_t neutron_fnv1a64(const void * data, size_t n);
+// cache file for a Q4_0 tensor's packed form; "" when NEUTRON_CACHE_DIR is set to an empty string (cache disabled)
+std::string neutron_cache_path(const void * q4_data, size_t size, int N, int K);
+// .npk on-disk format: npk_hdr, nchunks x npk_chunk, then each chunk's blob (64-byte aligned)
+struct npk_hdr { uint32_t magic, nchunks; };
+struct npk_chunk { uint32_t k, weight_len, compress_num, pad; uint64_t total; };
+static constexpr uint32_t NPK_MAGIC = 0x314b504e; // "NPK1"
+// Convert a whole Q4_0 tensor (N rows of K) into Neutron packed form, one sub-weight per K chunk, written into out.
+// Returns 0 on success, -1 if out_cap is too small. Layout pointers in L point into out.
+int neutron_pack_q4_0(const void * q4_data, int N, int K, const std::vector<int> & kc, uint8_t * out, size_t out_cap, std::vector<neutron_layout> & L);
+// Load a .npk into out (rebuilding layouts); returns 0 ok, -1 not found / invalid / too small.
+int neutron_npk_load(const std::string & path, int N, const std::vector<int> & kc, uint8_t * out, size_t out_cap, std::vector<neutron_layout> & L);
+// Write packed chunks to path atomically (tmp + rename). Creates parent dirs. Returns true on success.
+bool neutron_npk_write(const std::string & path, const std::vector<int> & kc, const std::vector<neutron_layout> & L);
+#endif

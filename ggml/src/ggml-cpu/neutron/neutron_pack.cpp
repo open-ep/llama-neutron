@@ -7,6 +7,12 @@
 #include <algorithm>
 #include <type_traits>
 #include <arm_neon.h>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
+#include <sys/stat.h>
 #include "neutron_pack.h"
 #include "neutron/NeutronDriver.h"
 #ifdef __cplusplus
@@ -684,9 +690,10 @@ int (*neutron_clean_cache)(const void *, int) = clean_cache;
 size_t neutron_pack_bound(int N, int K) {
     size_t bpc = K / 32;
     size_t raw = (size_t)N * K / 2;
-    // ponytail: Golomb-Rice may expand random data; 1.25x + slack. Tighten once offline pack cache exists.
+    // measured packed size is 0.595-0.602 B/param (compression ~= raw int4 + 12% metadata); a fat bound
+    // costs whole CMA regions on 14B-class models, so keep ~8% headroom: raw*1.10 + fixed slack
     return ALIGN16_SIZE(64) + ALIGN16_SIZE(N * bpc) + ALIGN16_SIZE(N * bpc * 2) + ALIGN16_SIZE(N * 4) * 2
-         + ALIGN16_SIZE(raw * 5 / 4 + 65536) + ALIGN16_SIZE(N * bpc * 4 / 8 + 4096) + 64;
+         + ALIGN16_SIZE(raw * 11 / 10 + 65536) + ALIGN16_SIZE(N * bpc * 4 / 8 + 4096) + 64;
 }
 
 int neutron_pack_nbits(const uint8_t* B, const float* scalesData, int N, int K, uint8_t* out, size_t out_cap, neutron_layout* L) {
@@ -786,4 +793,130 @@ void neutron_layout_from_blob(uint8_t* out, int N, int K, uint32_t weight_len, i
     memset(L->header, 0, 16 * sizeof(uint32_t));
     memset(L->decode_input, 1, ilength);
     neutron_clean_cache(out, (int)L->total);
+}
+
+
+// ======================= shared helpers (backend + neutron-pack tool) =======================
+static const std::set<int> & k_allowed() {
+    static std::set<int> allow = [] {
+        // Verified on Neutron firmware 3.1.1: correct and deterministic across repeated runs at M=1..2048.
+        // Values NOT listed here (notably 1152, 5632, 6912, 7168, 11008, 13824) hit firmware tiling bugs
+        // and are decomposed into these chunks instead -- e.g. 1152 = 1024 + 128.
+        std::set<int> s = {128, 256, 384, 512, 640, 768, 896, 1024, 2048, 2560, 2624,
+                           4096, 4864, 5120, 8192, 9216, 9728, 10240, 10752};
+        if (const char * e = getenv("NEUTRON_K_ALLOW")) {
+            s.clear();
+            for (const char * p = e; *p; ) { s.insert(atoi(p)); while (*p && *p != ',') p++; if (*p) p++; }
+        }
+        return s;
+    }();
+    return allow;
+}
+static bool split_rec(int K, std::vector<int> & out, size_t depth, size_t limit) {
+    if (K == 0) return true;
+    if (depth == limit) return false;
+    for (auto it = k_allowed().rbegin(); it != k_allowed().rend(); ++it) {
+        if (*it > K) continue;
+        out.push_back(*it);
+        if (split_rec(K - *it, out, depth + 1, limit)) return true;
+        out.pop_back();
+    }
+    return false;
+}
+const std::vector<int> & neutron_k_chunks(int K) {
+    static std::map<int, std::vector<int>> cache;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> g(mu);
+    auto it = cache.find(K);
+    if (it != cache.end()) return it->second;
+    std::vector<int> out;
+    for (size_t limit = 1; limit <= 6 && !split_rec(K, out, 0, limit); limit++) out.clear();
+    return cache[K] = out;
+}
+
+uint64_t neutron_fnv1a64(const void * data, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t * p = (const uint8_t *)data;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }
+    for (; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
+std::string neutron_cache_path(const void * data, size_t size, int N, int K) {
+    const char * dir = getenv("NEUTRON_CACHE_DIR");
+    if (dir && !*dir) return "";
+    std::string d = dir ? dir : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/.cache/ggml-neutron";
+    char buf[128];
+    snprintf(buf, sizeof buf, "/%016llx_%dx%d.npk", (unsigned long long)neutron_fnv1a64(data, size), N, K);
+    return d + buf;
+}
+
+// GGUF Q4_0 block: fp16 scale + 32 nibbles (first 16 elements in low nibbles, next 16 in high nibbles)
+struct q4_0_block { uint16_t d; uint8_t qs[16]; };
+static inline float fp16_to_fp32(uint16_t h) { _Float16 f; memcpy(&f, &h, 2); return (float)f; }
+
+int neutron_pack_q4_0(const void * q4_data, int N, int K, const std::vector<int> & kc, uint8_t * out, size_t cap, std::vector<neutron_layout> & L) {
+    const int bpc = K / 32;
+    const size_t row = (size_t)bpc * sizeof(q4_0_block);
+    L.assign(kc.size(), neutron_layout{});
+    int b0 = 0;
+    for (size_t c = 0; c < kc.size(); c++) {
+        const int k = kc[c], bc = k / 32;
+        // Q4_0 columns [b0*32, (b0+bc)*32) -> MatMulNBits nibble layout (elem 2j low, 2j+1 high) + fp32 scales
+        std::vector<uint8_t> nib((size_t)N * bc * 16);
+        std::vector<float> scales((size_t)N * bc);
+        for (int n = 0; n < N; n++) {
+            const q4_0_block * blk = (const q4_0_block *)((const uint8_t *)q4_data + n * row) + b0;
+            for (int b = 0; b < bc; b++) {
+                scales[(size_t)n * bc + b] = fp16_to_fp32(blk[b].d);
+                uint8_t * o = &nib[((size_t)n * bc + b) * 16];
+                for (int j = 0; j < 16; j++) {
+                    auto el = [&](int e) -> uint8_t { return e < 16 ? (blk[b].qs[e] & 0x0F) : (blk[b].qs[e - 16] >> 4); };
+                    o[j] = (uint8_t)(el(2 * j) | (el(2 * j + 1) << 4));
+                }
+            }
+        }
+        if (neutron_pack_nbits(nib.data(), scales.data(), N, k, out, cap, &L[c]) != 0) return -1;
+        const size_t used = ALIGN16_SIZE(L[c].total); const size_t pad = (64 - used % 64) % 64;
+        out += used + pad; cap -= used + pad; b0 += bc;
+    }
+    return 0;
+}
+
+int neutron_npk_load(const std::string & path, int N, const std::vector<int> & kc, uint8_t * out, size_t cap, std::vector<neutron_layout> & L) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return -1;
+    npk_hdr h; std::vector<npk_chunk> ch;
+    bool ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == NPK_MAGIC && h.nchunks == kc.size();
+    if (ok) { ch.resize(h.nchunks); ok = fread(ch.data(), sizeof(npk_chunk), h.nchunks, f) == h.nchunks; }
+    L.assign(kc.size(), neutron_layout{});
+    uint8_t * o = out; size_t rem = cap;
+    for (size_t c = 0; ok && c < ch.size(); c++) {
+        ok = ch[c].k == (uint32_t)kc[c] && ch[c].total <= rem && fread(o, 1, ch[c].total, f) == ch[c].total;
+        if (ok) {
+            neutron_layout_from_blob(o, N, ch[c].k, ch[c].weight_len, ch[c].compress_num, &L[c]);
+            if (L[c].total != ch[c].total) { ok = false; break; }
+            const size_t used = ALIGN16_SIZE(ch[c].total); const size_t pad = (64 - used % 64) % 64;
+            o += used + pad; rem -= used + pad;
+        }
+    }
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+bool neutron_npk_write(const std::string & path, const std::vector<int> & kc, const std::vector<neutron_layout> & L) {
+    std::string dir = path.substr(0, path.rfind('/'));
+    for (size_t i = 1; i < dir.size(); i++) if (dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755);
+    mkdir(dir.c_str(), 0755);
+    std::string tmp = path + ".tmp";
+    FILE * f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    npk_hdr h = { NPK_MAGIC, (uint32_t)kc.size() };
+    bool ok = fwrite(&h, sizeof h, 1, f) == 1;
+    for (size_t c = 0; ok && c < kc.size(); c++) { npk_chunk ch = { (uint32_t)kc[c], L[c].weight_len, (uint32_t)L[c].compress_num, 0, L[c].total }; ok = fwrite(&ch, sizeof ch, 1, f) == 1; }
+    for (size_t c = 0; ok && c < kc.size(); c++) ok = fwrite(L[c].header, 1, L[c].total, f) == L[c].total;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) { remove(tmp.c_str()); return false; }
+    return rename(tmp.c_str(), path.c_str()) == 0;
 }

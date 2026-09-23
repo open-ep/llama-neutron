@@ -52,26 +52,6 @@ struct prof_t {
 static prof_t & P() { static prof_t p; return p; }
 static inline double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-// ---- packed-weight cache: packing is deterministic and slow (~0.45 s/MB on A55), so keep the result on disk ----
-static uint64_t fnv1a64(const void * data, size_t n, uint64_t h = 1469598103934665603ull) {
-    const uint8_t * p = (const uint8_t *)data;
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }
-    for (; i < n; i++) h = (h ^ p[i]) * 1099511628211ull;
-    return h;
-}
-static std::string cache_path(const void * data, size_t size, int N, int K) {
-    const char * dir = getenv("NEUTRON_CACHE_DIR");
-    if (dir && !*dir) return "";                       // NEUTRON_CACHE_DIR="" disables the cache
-    std::string d = dir ? dir : std::string(getenv("HOME") ? getenv("HOME") : "/tmp") + "/.cache/ggml-neutron";
-    char buf[128];
-    snprintf(buf, sizeof buf, "/%016llx_%dx%d.npk", (unsigned long long)fnv1a64(data, size), N, K);
-    return d + buf;
-}
-struct npk_hdr { uint32_t magic, nchunks; };            // followed by nchunks x npk_chunk, then the blobs (64-aligned)
-struct npk_chunk { uint32_t k, weight_len, compress_num, pad; uint64_t total; };
-static constexpr uint32_t NPK_MAGIC = 0x314b504e; // "NPK1"
-
 // ---- NPU memory: regions of contiguous CMA; weights bump-allocated from the bottom, A/Y scratch at the top ----
 struct region {
     uint8_t * cpu = nullptr; uint64_t dma = 0; int fd = -1;   // fd < 0: slot of the libNeutronDriver buffer
@@ -92,7 +72,7 @@ struct dev {
         std::lock_guard<std::mutex> g(mu);
         if (ready) return true;
         direct = env_int("NEUTRON_DIRECT", 0) != 0;
-        reserved = (size_t)env_int("NEUTRON_SCRATCH_MB", direct ? 256 : 192) << 20;
+        reserved = (size_t)env_int("NEUTRON_SCRATCH_MB", direct ? 128 : 192) << 20;
         if (!direct) {
             int n = std::max(1, std::min(env_int("NEUTRON_SLOTS", 4), 7));   // 8*512MB overflows the driver's u32 size
             void * p = nullptr;
@@ -112,6 +92,10 @@ struct dev {
             if (dfd < 0) { perror("ggml-neutron: open /dev/neutron0"); return false; }
             region_bytes = (size_t)std::min(env_int("NEUTRON_BUF_MB", 2048), 2048) << 20;   // firmware header offsets are signed 32-bit: keep every region under 2 GiB
             fprintf(stderr, "ggml-neutron: direct mode, regions of %zu MB, scratch %zu MB/region\n", region_bytes >> 20, reserved >> 20);
+            // Grab the regions now, while the CMA pool is still clean: once llama.cpp mmaps and prefetches the
+            // GGUF, its page cache lands in the reusable CMA and cma_alloc() can fail to migrate it (EBUSY).
+            int pre = env_int("NEUTRON_PREALLOC_REGIONS", 0);
+            for (int i = 0; i < pre; i++) if (!new_region(region_bytes)) { fprintf(stderr, "ggml-neutron: prealloc stopped at %d regions\n", i); break; }
         }
         ready = true;
         return true;
@@ -184,41 +168,6 @@ static int hook_clean_cache(const void * p, int n) {
     if (ri < 0) return clean_cache(p, n);
     D().sync(ri, (const uint8_t *)p - D().regions[ri].cpu, n, false);
     return 0;
-}
-
-// K values verified correct on firmware 3.1.1 (M=1..2048, deterministic). Other K are split into these chunks
-// and the partial products summed on the CPU (firmware tiling bugs above 10752 and at several odd sizes).
-static const std::set<int> & k_allowed() {
-    static std::set<int> allow = [] {
-        std::set<int> s = {896, 1024, 2048, 2560, 4096, 4864, 5120, 8192, 9216, 9728, 10240, 10752};
-        if (const char * e = getenv("NEUTRON_K_ALLOW")) {
-            s.clear();
-            for (const char * p = e; *p; ) { s.insert(atoi(p)); while (*p && *p != ',') p++; if (*p) p++; }
-        }
-        return s;
-    }();
-    return allow;
-}
-static bool split_rec(int K, std::vector<int> & out, size_t depth, size_t limit) {
-    if (K == 0) return true;
-    if (depth == limit) return false;
-    for (auto it = k_allowed().rbegin(); it != k_allowed().rend(); ++it) {
-        if (*it > K) continue;
-        out.push_back(*it);
-        if (split_rec(K - *it, out, depth + 1, limit)) return true;
-        out.pop_back();
-    }
-    return false;
-}
-static const std::vector<int> & k_chunks(int K) {   // minimal-count partition of K into allowed chunks; empty if impossible
-    static std::map<int, std::vector<int>> cache;
-    static std::mutex mu;
-    std::lock_guard<std::mutex> g(mu);
-    auto it = cache.find(K);
-    if (it != cache.end()) return it->second;
-    std::vector<int> out;
-    for (size_t limit = 1; limit <= 6 && !split_rec(K, out, 0, limit); limit++) out.clear();
-    return cache[K] = out;
 }
 
 // ---- per-tensor state (tensor->extra) ----
@@ -331,7 +280,7 @@ static void * buffer_get_base(ggml_backend_buffer_t buffer) { return ((buffer_ct
 static enum ggml_status buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     auto * t = new tensor_traits();   // ponytail: leaked with the model, same as repack's static traits
     t->K = (int)tensor->ne[0]; t->N = (int)tensor->ne[1];
-    t->kc = k_chunks(t->K);
+    t->kc = neutron_k_chunks(t->K);
     t->ri = ((buffer_ctx *)buffer->context)->ri;
     tensor->extra = t;
     return GGML_STATUS_SUCCESS;
@@ -342,73 +291,20 @@ static void buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor *
     auto * t = (tensor_traits *)tensor->extra;
     const int K = t->K, N = t->N;
     GGML_ASSERT(!t->kc.empty());
-    const size_t row = ggml_row_size(GGML_TYPE_Q4_0, K);
     uint8_t * out = (uint8_t *)tensor->data;
-    size_t cap = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
-    t->L.resize(t->kc.size());
-    const std::string cpath = cache_path(data, size, N, K);
-    if (!cpath.empty()) {
-        if (FILE * f = fopen(cpath.c_str(), "rb")) {
-            npk_hdr h; std::vector<npk_chunk> ch;
-            bool ok = fread(&h, sizeof h, 1, f) == 1 && h.magic == NPK_MAGIC && h.nchunks == t->kc.size();
-            if (ok) { ch.resize(h.nchunks); ok = fread(ch.data(), sizeof(npk_chunk), h.nchunks, f) == h.nchunks; }
-            uint8_t * o = out; size_t rem = cap;
-            for (size_t c = 0; ok && c < ch.size(); c++) {
-                ok = ch[c].k == (uint32_t)t->kc[c] && ch[c].total <= rem && fread(o, 1, ch[c].total, f) == ch[c].total;
-                if (ok) { neutron_layout_from_blob(o, N, ch[c].k, ch[c].weight_len, ch[c].compress_num, &t->L[c]); GGML_ASSERT(t->L[c].total == ch[c].total);
-                          const size_t used = GGML_PAD(ch[c].total, 64); o += used; rem -= used; }
-            }
-            fclose(f);
-            if (ok) {
-                t->packed = true;
-                if (verbose()) fprintf(stderr, "ggml-neutron: loaded %s from cache %s\n", tensor->name, cpath.c_str());
-                return;
-            }
-            fprintf(stderr, "ggml-neutron: bad cache file %s, repacking\n", cpath.c_str());
-        }
+    const size_t cap = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+    const std::string cpath = neutron_cache_path(data, size, N, K);
+    if (!cpath.empty() && neutron_npk_load(cpath, N, t->kc, out, cap, t->L) == 0) {
+        t->packed = true;
+        if (verbose()) fprintf(stderr, "ggml-neutron: loaded %s from cache %s\n", tensor->name, cpath.c_str());
+        return;
     }
-    int b0 = 0;
-    for (size_t c = 0; c < t->kc.size(); c++) {
-        const int k = t->kc[c], bc = k / QK4_0;
-        // Q4_0 columns [b0*32, (b0+bc)*32) -> MatMulNBits nibble layout + fp32 scales
-        std::vector<uint8_t> nib((size_t)N * bc * 16);
-        std::vector<float> scales((size_t)N * bc);
-        for (int n = 0; n < N; n++) {
-            const block_q4_0 * blk = (const block_q4_0 *)((const uint8_t *)data + n * row) + b0;
-            for (int b = 0; b < bc; b++) {
-                scales[(size_t)n * bc + b] = GGML_FP16_TO_FP32(blk[b].d);
-                uint8_t * o = &nib[((size_t)n * bc + b) * 16];
-                for (int j = 0; j < 16; j++) {
-                    auto el = [&](int e) -> uint8_t { return e < 16 ? (blk[b].qs[e] & 0x0F) : (blk[b].qs[e - 16] >> 4); };
-                    o[j] = (uint8_t)(el(2 * j) | (el(2 * j + 1) << 4));
-                }
-            }
-        }
-        int rc = neutron_pack_nbits(nib.data(), scales.data(), N, k, out, cap, &t->L[c]);
-        if (rc != 0) {
-            fprintf(stderr, "ggml-neutron: packed size %zu exceeds remaining %zu for %s (%dx%d chunk %d)\n", t->L[c].total, cap, tensor->name, N, K, k);
-            GGML_ABORT("neutron pack overflow");
-        }
-        const size_t used = GGML_PAD(t->L[c].total, 64);
-        out += used; cap -= used; b0 += bc;
+    if (neutron_pack_q4_0(data, N, K, t->kc, out, cap, t->L) != 0) {
+        fprintf(stderr, "ggml-neutron: packed size exceeds allocation (%zu) for %s (%dx%d)\n", cap, tensor->name, N, K);
+        GGML_ABORT("neutron pack overflow");
     }
     t->packed = true;
-    if (!cpath.empty()) {
-        std::string dir = cpath.substr(0, cpath.rfind('/'));
-        for (size_t i = 1; i < dir.size(); i++) if (dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755);   // mkdir -p
-        mkdir(dir.c_str(), 0755);
-        std::string tmp = cpath + ".tmp";
-        FILE * f = fopen(tmp.c_str(), "wb");
-        if (!f) fprintf(stderr, "ggml-neutron: cannot write cache %s\n", tmp.c_str());
-        else {
-            npk_hdr h = { NPK_MAGIC, (uint32_t)t->kc.size() };
-            fwrite(&h, sizeof h, 1, f);
-            for (size_t c = 0; c < t->kc.size(); c++) { npk_chunk ch = { (uint32_t)t->kc[c], t->L[c].weight_len, (uint32_t)t->L[c].compress_num, 0, t->L[c].total }; fwrite(&ch, sizeof ch, 1, f); }
-            for (size_t c = 0; c < t->kc.size(); c++) fwrite(t->L[c].header, 1, t->L[c].total, f);
-            fclose(f);
-            rename(tmp.c_str(), cpath.c_str());
-        }
-    }
+    if (!cpath.empty() && !neutron_npk_write(cpath, t->kc, t->L)) fprintf(stderr, "ggml-neutron: cannot write cache %s\n", cpath.c_str());
     if (verbose()) {
         size_t tot = 0; for (auto & l : t->L) tot += l.total;
         fprintf(stderr, "ggml-neutron: packed %s N=%d K=%d (%zu chunk%s) -> %zu bytes (%.3f B/param) region %d\n",
@@ -451,7 +347,7 @@ static size_t buft_get_max_size(ggml_backend_buffer_type_t) {
 static size_t buft_get_alloc_size(ggml_backend_buffer_type_t, const struct ggml_tensor * t) {
     if (t->type == GGML_TYPE_Q4_0 && ggml_n_dims(t) == 2) {
         size_t s = 0;
-        for (int k : k_chunks((int)t->ne[0])) s += GGML_PAD(neutron_pack_bound((int)t->ne[1], k), 64);
+        for (int k : neutron_k_chunks((int)t->ne[0])) s += GGML_PAD(neutron_pack_bound((int)t->ne[1], k), 64);
         if (s) return s;
     }
     return ggml_nbytes(t);
@@ -466,7 +362,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || a->ne[2] != 1 || a->ne[3] != 1) return false;
         if (a->buffer && !ggml_backend_buft_is_host(a->buffer->buft)) return false;
         const int64_t K = w->ne[0], N = w->ne[1];
-        return (N % 128 == 0) && (K % 32 == 0) && !k_chunks((int)K).empty();
+        return (N % 128 == 0) && (K % 32 == 0) && !neutron_k_chunks((int)K).empty();
     }
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT && op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_neutron_buffer_type())
