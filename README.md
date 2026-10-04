@@ -1,3 +1,6 @@
+> **This fork adds NXP i.MX 95 Neutron NPU support.** See [docs/backend/NEUTRON.md](docs/backend/NEUTRON.md) for results, build and usage.
+> The rest of this README is upstream llama.cpp.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
