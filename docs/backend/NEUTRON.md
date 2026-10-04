@@ -79,7 +79,9 @@ NEUTRON_DISABLE=1 ./llama-completion -m Qwen3-8B-Q4_0.gguf -p "Hello" -n 64 -t 6
 - Only 2D `Q4_0` `MUL_MAT` is offloaded; MoE (`MUL_MAT_ID`) and other ops stay on the CPU
 - Some matrix widths (K) hit tiling bugs in NPU firmware 3.1.1; they are split into verified
   chunks automatically. A different firmware may need the list re-checked
-- First-time packing is slow and needs the NPU; `libNeutronDriver.so` is aarch64-only
+- First-time packing is slow. It uses the packer in NXP's `libNeutronDriver.so`, which is
+  aarch64-only, so pack on the board or another aarch64 Linux machine (`tools/neutron-pack`).
+  The NPU itself is not needed for packing
 
 ## License
 
