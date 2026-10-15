@@ -1,0 +1,14 @@
+Third-party code in this directory
+==================================
+
+MeraDrpRuntimeWrapper.cpp and MeraDrpRuntimeWrapper.h are copied unchanged from
+Renesas' DRP-AI TVM repository (apps/MeraDrpRuntimeWrapper.*):
+
+    https://github.com/renesas-rz/rzv_drp-ai_tvm
+    v2.8.0-hotfix2, commit 63c44ef
+
+    (C) Copyright EdgeCortix, Inc. 2024
+    Licensed under the Apache License, Version 2.0 (the repository LICENSE file).
+
+The DRP objects the backend loads (shape templates) are produced by the Renesas
+DRP-AI Translator and are not part of this repository.
