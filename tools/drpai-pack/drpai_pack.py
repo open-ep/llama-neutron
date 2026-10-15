@@ -31,7 +31,12 @@ def pack_weight(Wq, ws, in_s, out_s):
     """Wq int8 (K, N) as in the quantized ONNX; ws (N,) per-channel weight scales.  The output channels are cut into
     tiles of 256; weight.bin = all tile bodies, then all tile PPU arrays, then all tile tails."""
     K, N = Wq.shape
-    parts = [_pack_tile(Wq[:, t:t + OCH_TILE], ws[t:t + OCH_TILE], in_s, out_s) for t in range(0, N, OCH_TILE)]
+    cuts = list(range(0, N - N % OCH_TILE + 1, OCH_TILE))
+    rem = N % OCH_TILE                                      # partial last tile: a multiple-of-64 group, then the rest (seen: 128 -> 128, 112 -> 64+48)
+    if rem - rem % 64: cuts.append(N - rem % 64)
+    cuts.append(N)
+    cuts = sorted(set(cuts))
+    parts = [_pack_tile(Wq[:, a:b], ws[a:b], in_s, out_s) for a, b in zip(cuts, cuts[1:])]
     n_kslice = -(-K // ICH_SLICE)                          # K > ICH_SLICE: one pass-through tail record per extra slice
     if n_kslice > 1:
         z = np.zeros(64, np.uint16); z[8] = 1
