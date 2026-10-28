@@ -800,8 +800,9 @@ void neutron_layout_from_blob(uint8_t* out, int N, int K, uint32_t weight_len, i
 static const std::set<int> & k_allowed() {
     static std::set<int> allow = [] {
         // Verified on Neutron firmware 3.1.1: correct and deterministic across repeated runs at M=1..2048.
-        // Values NOT listed here (notably 1152, 5632, 6912, 7168, 11008, 13824) hit firmware tiling bugs
-        // and are decomposed into these chunks instead -- e.g. 1152 = 1024 + 128.
+        // Values NOT listed here (notably 1152, 3840, 5632, 6912, 7168, 11008, 13824) hit firmware tiling bugs
+        // and are decomposed into these chunks instead -- e.g. 1152 = 1024 + 128, 3840 = 2560 + 1024 + 256
+        // (3840 re-checked on fw 3.1.2: ~3.4% relRMS and run-to-run drift at M>=512; the split path is 1.2%).
         std::set<int> s = {128, 256, 384, 512, 640, 768, 896, 1024, 2048, 2560, 2624,
                            4096, 4864, 5120, 8192, 9216, 9728, 10240, 10752};
         if (const char * e = getenv("NEUTRON_K_ALLOW")) {
