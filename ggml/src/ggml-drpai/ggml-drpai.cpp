@@ -546,15 +546,16 @@ static void drpai_get_rows(struct ggml_tensor * dst) {
 }
 
 // ---- buffer (plain host memory, so the CPU backend can also read it) ----
+static bool drpai_stub_tensor(const struct ggml_tensor * t);
 static void drpai_buffer_free(ggml_backend_buffer_t buffer) { free(buffer->context); }
 static void * drpai_buffer_get_base(ggml_backend_buffer_t buffer) { return buffer->context; }
 static enum ggml_status drpai_buffer_init_tensor(ggml_backend_buffer_t, struct ggml_tensor * tensor) {
     tensor->extra = drpai_has_weight(tensor) ? drpai_get_weight(tensor) : nullptr;
     return GGML_STATUS_SUCCESS;
 }
-static void drpai_buffer_memset_tensor(ggml_backend_buffer_t, struct ggml_tensor * t, uint8_t v, size_t off, size_t n) { memset((char *) t->data + off, v, n); }
-static void drpai_buffer_set_tensor(ggml_backend_buffer_t, struct ggml_tensor * t, const void * d, size_t off, size_t n) { memcpy((char *) t->data + off, d, n); }
-static void drpai_buffer_get_tensor(ggml_backend_buffer_t, const struct ggml_tensor * t, void * d, size_t off, size_t n) { memcpy(d, (const char *) t->data + off, n); }
+static void drpai_buffer_memset_tensor(ggml_backend_buffer_t, struct ggml_tensor * t, uint8_t v, size_t off, size_t n) { if (!drpai_stub_tensor(t)) memset((char *) t->data + off, v, n); }
+static void drpai_buffer_set_tensor(ggml_backend_buffer_t, struct ggml_tensor * t, const void * d, size_t off, size_t n) { if (!drpai_stub_tensor(t)) memcpy((char *) t->data + off, d, n); }
+static void drpai_buffer_get_tensor(ggml_backend_buffer_t, const struct ggml_tensor * t, void * d, size_t off, size_t n) { if (drpai_stub_tensor(t)) memset(d, 0, n); else memcpy(d, (const char *) t->data + off, n); }
 static bool drpai_buffer_cpy_tensor(ggml_backend_buffer_t, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     if (ggml_backend_buffer_is_host(src->buffer)) { memcpy(dst->data, src->data, ggml_nbytes(src)); return true; }
     return false;
@@ -580,6 +581,11 @@ static ggml_backend_buffer_t drpai_buft_alloc_buffer(ggml_backend_buffer_type_t 
     return ggml_backend_buffer_init(buft, drpai_buffer_i, p, size);
 }
 static size_t drpai_buft_get_alignment(ggml_backend_buffer_type_t) { return 64; }
+// a weight that runs on the DRP needs no host copy (the embedding is also read by GET_ROWS, so it keeps its data)
+static bool drpai_stub_tensor(const struct ggml_tensor * t) {
+    return t->ne[1] > 1 && strcmp(t->name, "token_embd.weight") != 0 && drpai_has_weight(t);
+}
+static size_t drpai_buft_get_alloc_size(ggml_backend_buffer_type_t, const struct ggml_tensor * t) { return drpai_stub_tensor(t) ? 64 : ggml_nbytes(t); }
 static bool drpai_buft_is_host(ggml_backend_buffer_type_t) { return true; }
 
 ggml_backend_buffer_type_t ggml_backend_drpai_buffer_type(void) {
@@ -589,7 +595,7 @@ ggml_backend_buffer_type_t ggml_backend_drpai_buffer_type(void) {
             /* .alloc_buffer     = */ drpai_buft_alloc_buffer,
             /* .get_alignment    = */ drpai_buft_get_alignment,
             /* .get_max_size     = */ NULL,
-            /* .get_alloc_size   = */ NULL,
+            /* .get_alloc_size   = */ drpai_buft_get_alloc_size,
             /* .is_host          = */ drpai_buft_is_host,
         },
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_drpai_reg(), 0),
@@ -668,7 +674,7 @@ static bool drpai_dev_supports_op(ggml_backend_dev_t, const struct ggml_tensor *
     switch (op->op) {
         case GGML_OP_NONE: case GGML_OP_RESHAPE: case GGML_OP_VIEW: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE: return true;
         case GGML_OP_GET_ROWS:
-            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && src0->ne[2] == 1 && drpai_has_weight(src0);
+            return op->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I32 && src0->ne[2] == 1 && drpai_has_weight(src0) && !drpai_stub_tensor(src0);
         case GGML_OP_MUL_MAT:
             return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && src0->ne[2] == 1 && src0->ne[3] == 1
                 && src1->ne[2] == 1 && src1->ne[3] == 1 && drpai_has_weight(src0);
