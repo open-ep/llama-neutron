@@ -182,16 +182,19 @@ class tensor_traits : public ggml::cpu::tensor_traits {
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
         if (op->op != GGML_OP_MUL_MAT) return false;
-        if (params->ith != 0) return true;     // ponytail: NPU path is serial; other threads idle at the barrier
-        run(op);
+        run(params, op);
         return true;
     }
 
-    void run(struct ggml_tensor * op) {
+    // All threads enter. Gather/quantize/dequantize are split by rows across the thread pool; only thread 0
+    // talks to the NPU. Three barriers per job (after quantize, after the NPU job, after dequantize) keep the
+    // shared scratch (a_npu / in_scales / y) consistent between phases.
+    void run(struct ggml_compute_params * params, struct ggml_tensor * op) {
+        const int ith = params->ith, nth = params->nth;
         const ggml_tensor * A = op->src[1];
         const int64_t M = A->ne[1];
         GGML_ASSERT(packed && A->ne[0] == K && op->ne[0] == N && op->ne[1] == M);
-        if (P().on) P().calls++;
+        if (ith == 0 && P().on) P().calls++;
         const int kmax = *std::max_element(kc.begin(), kc.end());
         const region & R = D().regions[ri];
         const size_t sc_off = R.scratch_off;
@@ -199,14 +202,17 @@ class tensor_traits : public ggml::cpu::tensor_traits {
         const size_t budget = D().reserved - 4096;
         int64_t max_m = std::min<int64_t>((int64_t)(budget / ((size_t)kmax + (size_t)N * 4)), 2048);  // 2048 = firmware M tile limit
         GGML_ASSERT(max_m >= 1);
-        // ponytail: compute is serialized on thread 0, so one set of host scratch buffers is reused across calls
+        // one set of host scratch buffers reused across calls; resized by thread 0 before anyone touches them
         static std::vector<float> in_scales, a_tmp, y_tmp;
         const int64_t mm = std::min<int64_t>(M, max_m);
-        if (in_scales.size() < (size_t)mm) in_scales.resize(mm);
-        if (kc.size() > 1) {
-            if (a_tmp.size() < (size_t)mm * kmax) a_tmp.resize((size_t)mm * kmax);
-            if (y_tmp.size() < (size_t)mm * N)    y_tmp.resize((size_t)mm * N);
+        if (ith == 0) {
+            if (in_scales.size() < (size_t)mm) in_scales.resize(mm);
+            if (kc.size() > 1) {
+                if (a_tmp.size() < (size_t)mm * kmax) a_tmp.resize((size_t)mm * kmax);
+                if (y_tmp.size() < (size_t)mm * N)    y_tmp.resize((size_t)mm * N);
+            }
         }
+        ggml_barrier(params->threadpool);
 
         for (int64_t m0 = 0; m0 < M; m0 += max_m) {
             const int64_t m = std::min(max_m, M - m0);
@@ -215,56 +221,65 @@ class tensor_traits : public ggml::cpu::tensor_traits {
             int32_t * y_npu = (int32_t *)(R.cpu + y_off);
             const float * a_in = (const float *)((const uint8_t *)A->data + m0 * A->nb[1]);
             float * y_out = (float *)((uint8_t *)op->data + m0 * op->nb[1]);
+            // this thread's row range of the current m block
+            const int64_t r0 = m * ith / nth, r1 = m * (ith + 1) / nth, rows = r1 - r0;
 
             int k0 = 0;
             for (size_t c = 0; c < kc.size(); c++) {
                 const int k = kc[c];
+                const size_t a_size = (size_t)m * k, y_size = (size_t)m * N * 4;
+                double tg = (ith == 0 && P().on) ? now_s() : 0;
                 const float * a_src = a_in;
-                double tg = P().on ? now_s() : 0;
-                if (kc.size() > 1) {   // gather the K slice into a contiguous m x k block
-                    for (int64_t r = 0; r < m; r++) memcpy(&a_tmp[(size_t)r * k], a_in + (size_t)r * K + k0, (size_t)k * 4);
+                if (kc.size() > 1) {   // gather this thread's rows of the K slice into a contiguous m x k block
+                    for (int64_t r = r0; r < r1; r++) memcpy(&a_tmp[(size_t)r * k], a_in + (size_t)r * K + k0, (size_t)k * 4);
                     a_src = a_tmp.data();
                 }
-                const size_t a_size = (size_t)m * k, y_size = (size_t)m * N * 4;
-                double tq = P().on ? now_s() : 0;
-                QuantizeInput(a_src, a_npu, in_scales.data(), (uint32_t)m, (uint32_t)k);
-                if (!D().direct) D().sync(ri, sc_off, a_size, false);   // direct mode: driver syncs the input range itself
-                if (P().on) { P().gather += tq - tg; P().quant += now_s() - tq; P().jobs++; P().bytes += L[c].total; }
+                double tq = (ith == 0 && P().on) ? now_s() : 0;
+                if (rows > 0) QuantizeInput(a_src + (size_t)r0 * k, a_npu + (size_t)r0 * k, in_scales.data() + r0, (uint32_t)rows, (uint32_t)k);
+                if (ith == 0 && P().on) { P().gather += tq - tg; P().quant += now_s() - tq; P().jobs++; P().bytes += L[c].total; }
+                ggml_barrier(params->threadpool);
 
-                neutron_layout & l = L[c];
-                uint32_t * h = l.header;
-                auto off = [&](const void * p) { return (uint32_t)((const uint8_t *)p - (const uint8_t *)h); };
-                h[0]  = off(l.compress_len);
-                h[1]  = off(l.decode_bias);
-                h[2]  = (uint32_t)m;
-                h[3]  = (uint32_t)k;
-                h[4]  = (uint32_t)N | (1u << 18);
-                h[5]  = off(a_npu);
-                h[6]  = off(l.b_neutron);
-                h[7]  = off(l.b_bias);
-                h[8]  = off(l.b_factors);
-                h[9]  = off(y_npu);
-                h[10] = (uint32_t)GetMatmulTypeFlag(true, false);
-                h[11] = 4;   // result bytes
-                h[12] = 4;   // weight bits
-                h[13] = 32;  // group size
-                h[14] = off(l.decode_scale);
-                h[15] = off(l.decode_input);
-
-                bool ok = D().job(ri, (uint8_t *)h - R.cpu, sc_off, a_size, y_off, y_size);
-                GGML_ASSERT(ok && "neutron matmul failed");
-                static const bool ysync = env_int("NEUTRON_YSYNC", 0) != 0;   // driver syncs the output range itself
-                if (!D().direct || ysync) D().sync(ri, y_off, y_size, true);
-                double td = P().on ? now_s() : 0;
-                if (kc.size() == 1) {
-                    DequantizeOutput(y_npu, y_out, in_scales.data(), 1, (uint32_t)m, (uint32_t)N);
-                } else {
-                    DequantizeOutput(y_npu, y_tmp.data(), in_scales.data(), 1, (uint32_t)m, (uint32_t)N);
-                    const size_t n = (size_t)m * N;
-                    if (c == 0) memcpy(y_out, y_tmp.data(), n * 4);
-                    else for (size_t i = 0; i < n; i++) y_out[i] += y_tmp[i];
+                if (ith == 0) {
+                    if (!D().direct) D().sync(ri, sc_off, a_size, false);   // direct mode: driver syncs the input range itself
+                    neutron_layout & l = L[c];
+                    uint32_t * h = l.header;
+                    auto off = [&](const void * p) { return (uint32_t)((const uint8_t *)p - (const uint8_t *)h); };
+                    h[0]  = off(l.compress_len);
+                    h[1]  = off(l.decode_bias);
+                    h[2]  = (uint32_t)m;
+                    h[3]  = (uint32_t)k;
+                    h[4]  = (uint32_t)N | (1u << 18);
+                    h[5]  = off(a_npu);
+                    h[6]  = off(l.b_neutron);
+                    h[7]  = off(l.b_bias);
+                    h[8]  = off(l.b_factors);
+                    h[9]  = off(y_npu);
+                    h[10] = (uint32_t)GetMatmulTypeFlag(true, false);
+                    h[11] = 4;   // result bytes
+                    h[12] = 4;   // weight bits
+                    h[13] = 32;  // group size
+                    h[14] = off(l.decode_scale);
+                    h[15] = off(l.decode_input);
+                    bool ok = D().job(ri, (uint8_t *)h - R.cpu, sc_off, a_size, y_off, y_size);
+                    GGML_ASSERT(ok && "neutron matmul failed");
+                    static const bool ysync = env_int("NEUTRON_YSYNC", 0) != 0;   // driver syncs the output range itself
+                    if (!D().direct || ysync) D().sync(ri, y_off, y_size, true);
                 }
-                if (P().on) P().dequant += now_s() - td;
+                ggml_barrier(params->threadpool);
+
+                double td = (ith == 0 && P().on) ? now_s() : 0;
+                if (rows > 0) {
+                    const size_t o = (size_t)r0 * N, n = (size_t)rows * N;
+                    if (kc.size() == 1) {
+                        DequantizeOutput(y_npu + o, y_out + o, in_scales.data() + r0, 1, (uint32_t)rows, (uint32_t)N);
+                    } else {
+                        DequantizeOutput(y_npu + o, y_tmp.data() + o, in_scales.data() + r0, 1, (uint32_t)rows, (uint32_t)N);
+                        if (c == 0) memcpy(y_out + o, y_tmp.data() + o, n * 4);
+                        else for (size_t i = o; i < o + n; i++) y_out[i] += y_tmp[i];
+                    }
+                }
+                if (ith == 0 && P().on) P().dequant += now_s() - td;
+                ggml_barrier(params->threadpool);   // in_scales / scratch are reused by the next job
                 k0 += k;
             }
         }
